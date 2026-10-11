@@ -1,0 +1,179 @@
+name: Exact-source Windows ARM64 validation
+'on':
+  push:
+    branches:
+    - hermes-ci/windows-arm64-07012ea399b9
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build-test-cp312:
+    strategy:
+      matrix:
+        ARCH:
+        - NAME: arm64
+          RUNNER: windows-11-arm
+          VCVARS: vcvarsarm64.bat
+          PLAT_NAME: win_arm64
+          PACKAGING_DRIVE: 'C:'
+          BUILD_ARGS: --onetbb
+          TIMEOUT: 90
+        PYTHON:
+        - VERSION_SPEC: '3.12'
+          ARM64_VERSION_SPEC: '3.12'
+          TAG: cp312
+    runs-on: ${{ matrix.ARCH.RUNNER }}
+    permissions:
+      contents: read
+    timeout-minutes: 90
+    env:
+      PACKAGING_DIR: ${{ matrix.ARCH.PACKAGING_DRIVE }}\packaging
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        repository: nithin-aashik-mcw/OpenUSD
+        ref: 07012ea399b9c76509f5d2fea193eb6c599cea3f
+        persist-credentials: false
+    - name: Verify exact public PR source SHA
+      shell: pwsh
+      env:
+        EXPECTED_SOURCE_SHA: 07012ea399b9c76509f5d2fea193eb6c599cea3f
+        SOURCE_REPOSITORY: nithin-aashik-mcw/OpenUSD
+      run: '$actual = (git rev-parse HEAD).Trim()
+
+        if ($LASTEXITCODE -ne 0 -or $actual -ne $env:EXPECTED_SOURCE_SHA) { throw "Unexpected source revision: $actual" }
+
+        @{ source_sha=$actual; source_repository=$env:SOURCE_REPOSITORY; ci_sha=$env:GITHUB_SHA; runner_arch=$env:RUNNER_ARCH
+        } | ConvertTo-Json | Set-Content provenance.json
+
+        '
+    - name: Install Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: ${{ matrix.ARCH.NAME == 'arm64' && matrix.PYTHON.ARM64_VERSION_SPEC || matrix.PYTHON.VERSION_SPEC
+          }}
+        architecture: ${{ matrix.ARCH.NAME }}
+        check-latest: false
+    - name: Install dependencies
+      run: 'python -m pip install setuptools
+
+        python -m pip install wheel
+
+        '
+      shell: cmd
+    - name: Build USD
+      run: ':: Locate Visual Studio with vswhere since the install path differs between runner images
+
+        for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products
+        * -property installationPath`) do set VS_INSTALL_DIR=%%i
+
+        call "%VS_INSTALL_DIR%\VC\Auxiliary\Build\${{ matrix.ARCH.VCVARS }}" || exit /b 1
+
+        set BOOST_ROOT=
+
+        python --version
+
+        python build_scripts/build_usd.py ${{ matrix.ARCH.BUILD_ARGS }} --build-monolithic --build-args USD,"-DPXR_ENABLE_PRECOMPILED_HEADERS=OFF
+        -DPXR_PY_UNDEFINED_DYNAMIC_LOOKUP=ON -DPXR_BUILD_USD_TOOLS=OFF -DPXR_BUILD_EXEC=OFF -DPXR_INSTALL_LOCATION=../pxr/pluginfo
+        -DPXR_PYTHON_INSTALL_DIR=lib/python" --no-materialx --no-imaging --no-examples --no-tutorials --build USDgen/build
+        --src USDgen/src USDinst -v
+
+        '
+      shell: cmd
+    - name: Packaging USD
+      run: 'dir
+
+        mkdir %PACKAGING_DIR%
+
+        xcopy /E /I USDinst %PACKAGING_DIR%\inst
+
+        copy build_scripts\pypi\package_files\* %PACKAGING_DIR%
+
+        copy LICENSE.txt %PACKAGING_DIR%
+
+        dir %PACKAGING_DIR%
+
+        dir %PACKAGING_DIR%\inst
+
+        '
+      shell: cmd
+    - name: Running setup.py
+      run: 'cd /d %PACKAGING_DIR%
+
+        python setup.py ${{ env.POST_RELEASE_TAG }} bdist_wheel --python-tag ${{ matrix.PYTHON.TAG }} --plat-name ${{ matrix.ARCH.PLAT_NAME
+        }}
+
+        dir
+
+        '
+      shell: cmd
+    - name: Verify native Python, wheel PE payloads and RECORD
+      shell: python
+      run: "import base64,csv,hashlib,io,json,pathlib,struct,sys,sysconfig,zipfile\nassert sysconfig.get_platform() == 'win-arm64',\
+        \ sysconfig.get_platform()\ndef machine(b):\n    assert b[:2] == b'MZ'\n    p=struct.unpack_from('<I', b, 0x3c)[0]\n\
+        \    assert b[p:p+4] == b'PE\\0\\0'\n    return struct.unpack_from('<H',b,p+4)[0]\nassert machine(pathlib.Path(sys.executable).read_bytes())\
+        \ == 0xaa64\nroots=[r'C:\\packaging\\dist']\nwheels=sorted({p for r in roots for p in pathlib.Path(r).glob('*.whl')})\n\
+        assert wheels, roots\nresult=[]\nfor path in wheels:\n    assert 'win_arm64' in path.name, path.name\n    with zipfile.ZipFile(path)\
+        \ as z:\n        records=[n for n in z.namelist() if n.endswith('.dist-info/RECORD')]\n        assert len(records)==1\n\
+        \        count=0\n        for n,h,size in csv.reader(io.StringIO(z.read(records[0]).decode())):\n            if h:\n\
+        \                alg,want=h.split('=',1)\n                b=z.read(n)\n                assert base64.urlsafe_b64encode(hashlib.new(alg,b).digest()).rstrip(b'=').decode()==want,n\n\
+        \                assert len(b)==int(size),n\n                count+=1\n        natives={n:hex(machine(z.read(n)))\
+        \ for n in z.namelist() if n.lower().endswith(('.pyd','.dll'))}\n        assert natives and all(x=='0xaa64' for x\
+        \ in natives.values()),natives\n        result.append({'wheel':path.name,'sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'record_verified':count,'native':natives})\n\
+        pathlib.Path('wheel-audit.json').write_text(json.dumps(result,indent=2))\nprint(json.dumps(result,indent=2))\n"
+    - name: Install wheel and run upstream packaging tests
+      shell: pwsh
+      run: '$ErrorActionPreference = ''Stop''
+
+        python -m venv wheel-test
+
+        if ($LASTEXITCODE -ne 0) { throw ''venv failed'' }
+
+        $py = Join-Path $PWD ''wheel-test/Scripts/python.exe''
+
+        & $py -m pip install pytest
+
+        if ($LASTEXITCODE -ne 0) { throw ''test tools failed'' }
+
+        $wheels = @(Get-ChildItem "$env:PACKAGING_DIR/dist/*.whl")
+
+        if ($wheels.Count -ne 1) { throw ''Expected one wheel'' }
+
+        & $py -m pip install $wheels[0].FullName
+
+        if ($LASTEXITCODE -ne 0) { throw ''wheel installation failed'' }
+
+        & $py -m pytest --junitxml=TEST-usdinstall.xml build_scripts/pypi/test.py
+
+        if ($LASTEXITCODE -ne 0) { throw ''upstream packaging tests failed'' }
+
+        & $py -c "from pxr import Usd, UsdGeom; s=Usd.Stage.CreateInMemory(); p=UsdGeom.Sphere.Define(s, ''/sphere''); p.GetRadiusAttr().Set(2.5);
+        text=s.GetRootLayer().ExportToString(); t=Usd.Stage.CreateInMemory(); assert t.GetRootLayer().ImportFromString(text);
+        assert UsdGeom.Sphere.Get(t,''/sphere'').GetRadiusAttr().Get()==2.5; print(''stage roundtrip passed'', Usd.GetVersion())"
+
+        if ($LASTEXITCODE -ne 0) { throw ''stage roundtrip failed'' }
+
+        '
+    - name: Upload usd-cp312-native-evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: usd-cp312-native-evidence
+        path: '${{ env.PACKAGING_DIR }}/dist/*.whl
+
+          provenance.json
+
+          wheel-audit.json
+
+          TEST-usdinstall.xml
+
+          USDgen/build/**/log.txt'
+        if-no-files-found: warn
+        retention-days: 14
+      if: ${{ always() }}
+env:
+  POST_RELEASE_TAG: ' '
+  CMAKE_BUILD_PARALLEL_LEVEL: '2'
